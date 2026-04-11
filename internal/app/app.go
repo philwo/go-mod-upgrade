@@ -25,6 +25,7 @@ type AppEnv struct {
 	Verbose  bool
 	Force    bool
 	List     bool
+	Tidy     bool
 	PageSize int
 	Hook     string
 	Ignore   []string
@@ -110,6 +111,14 @@ func workspacePaths(gowork string) ([]string, error) {
 
 // runDir discovers and updates the modules of one module directory.
 func (app *AppEnv) runDir(dir string, ignore []*regexp.Regexp, window time.Duration) error {
+	// Tidy first so that discovery sees a clean module graph. Listing must not
+	// modify go.mod, so it skips this.
+	if app.Tidy && !app.List {
+		if err := tidy(dir); err != nil {
+			return err
+		}
+	}
+
 	d := discover.Discoverer{Run: discover.Exec, Dir: dir, Ignore: ignore}
 	found, err := withSpinner(" Discovering modules...", func() (discovered, error) {
 		modules, err := d.Modules()
@@ -166,15 +175,25 @@ func (app *AppEnv) runDir(dir string, ignore []*regexp.Regexp, window time.Durat
 		listModules(modules)
 		return nil
 	}
+	selected := modules
 	if app.Force {
 		log.Debug("Update all modules in non-interactive mode...")
-		return update(dir, modules, app.Hook)
+	} else {
+		selected, err = prompt.Choose(modules, app.PageSize)
+		if err != nil {
+			return err
+		}
 	}
-	selected, err := prompt.Choose(modules, app.PageSize)
-	if err != nil {
+	if err := update(dir, selected, app.Hook); err != nil {
 		return err
 	}
-	return update(dir, selected, app.Hook)
+
+	// Tidy again, because go get can leave requirements that the updated
+	// modules no longer need.
+	if app.Tidy && len(selected) > 0 {
+		return tidy(dir)
+	}
+	return nil
 }
 
 // discovered is what one discovery pass produces: the modules, plus the log
@@ -250,6 +269,17 @@ func runGo(dir string, args ...string) ([]byte, error) {
 	cmd := exec.Command("go", args...)
 	cmd.Dir = dir
 	return cmd.CombinedOutput()
+}
+
+// tidy runs go mod tidy in dir.
+func tidy(dir string) error {
+	if _, err := fmt.Fprintln(color.Output, "Running go mod tidy..."); err != nil {
+		log.WithError(err).Error("Error while printing tidy progress")
+	}
+	if out, err := runGo(dir, "mod", "tidy"); err != nil {
+		return fmt.Errorf("go mod tidy: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func update(dir string, modules []module.Module, hook string) error {
